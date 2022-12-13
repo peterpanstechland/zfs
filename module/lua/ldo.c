@@ -170,7 +170,8 @@ static void seterrorobj (lua_State *L, int errcode, StkId oldtop) {
 /*
  * Silence infinite recursion warning which was added to -Wall in gcc 12.1
  */
-#if defined(HAVE_INFINITE_RECURSION)
+#if defined(__GNUC__) && !defined(__clang__) && \
+	defined(HAVE_KERNEL_INFINITE_RECURSION)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winfinite-recursion"
 #endif
@@ -196,7 +197,8 @@ l_noret luaD_throw (lua_State *L, int errcode) {
   }
 }
 
-#if defined(HAVE_INFINITE_RECURSION)
+#if defined(__GNUC__) && !defined(__clang__) && \
+	defined(HAVE_INFINITE_RECURSION)
 #pragma GCC diagnostic pop
 #endif
 
@@ -405,7 +407,7 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
       StkId base;
       Proto *p = clLvalue(func)->p;
       n = cast_int(L->top - func) - 1;  /* number of real arguments */
-      luaD_checkstack(L, p->maxstacksize);
+      luaD_checkstack(L, p->maxstacksize + p->numparams);
       for (; n < p->numparams; n++)
         setnilvalue(L->top++);  /* complete missing arguments */
       if (!p->is_vararg) {
@@ -452,7 +454,7 @@ int luaD_poscall (lua_State *L, StkId firstResult) {
   }
   res = ci->func;  /* res == final position of 1st result */
   wanted = ci->nresults;
-  L->ci = ci = ci->previous;  /* back to caller */
+  L->ci = ci->previous;  /* back to caller */
   /* move results to correct place */
   for (i = wanted; i != 0 && firstResult < L->top; i--)
     setobjs2s(L, res++, firstResult++);

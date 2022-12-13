@@ -548,7 +548,7 @@ usage(boolean_t requested)
 	    (strcmp(current_command->name, "get") == 0) ||
 	    (strcmp(current_command->name, "list") == 0))) {
 
-		(void) fprintf(fp,
+		(void) fprintf(fp, "%s",
 		    gettext("\nthe following properties are supported:\n"));
 
 		(void) fprintf(fp, "\n\t%-19s  %s   %s\n\n",
@@ -1196,6 +1196,7 @@ zpool_do_remove(int argc, char **argv)
 		return (1);
 
 	if (stop && noop) {
+		zpool_close(zhp);
 		(void) fprintf(stderr, gettext("stop request ignored\n"));
 		return (0);
 	}
@@ -2462,7 +2463,14 @@ print_status_config(zpool_handle_t *zhp, status_cbdata_t *cb, const char *name,
 	(void) nvlist_lookup_uint64_array(root, ZPOOL_CONFIG_SCAN_STATS,
 	    (uint64_t **)&ps, &c);
 
-	if (ps != NULL && ps->pss_state == DSS_SCANNING && children == 0) {
+	/*
+	 * If you force fault a drive that's resilvering, its scan stats can
+	 * get frozen in time, giving the false impression that it's
+	 * being resilvered.  That's why we check the state to see if the vdev
+	 * is healthy before reporting "resilvering" or "repairing".
+	 */
+	if (ps != NULL && ps->pss_state == DSS_SCANNING && children == 0 &&
+	    vs->vs_state == VDEV_STATE_HEALTHY) {
 		if (vs->vs_scan_processed != 0) {
 			(void) printf(gettext("  (%s)"),
 			    (ps->pss_func == POOL_SCAN_RESILVER) ?
@@ -2474,7 +2482,7 @@ print_status_config(zpool_handle_t *zhp, status_cbdata_t *cb, const char *name,
 
 	/* The top-level vdevs have the rebuild stats */
 	if (vrs != NULL && vrs->vrs_state == VDEV_REBUILD_ACTIVE &&
-	    children == 0) {
+	    children == 0 && vs->vs_state == VDEV_STATE_HEALTHY) {
 		if (vs->vs_rebuild_processed != 0) {
 			(void) printf(gettext("  (resilvering)"));
 		}
@@ -3765,7 +3773,12 @@ zpool_do_import(int argc, char **argv)
 	idata.scan = do_scan;
 	idata.policy = policy;
 
-	pools = zpool_search_import(g_zfs, &idata, &libzfs_config_ops);
+	libpc_handle_t lpch = {
+		.lpc_lib_handle = g_zfs,
+		.lpc_ops = &libzfs_config_ops,
+		.lpc_printerr = B_TRUE
+	};
+	pools = zpool_search_import(&lpch, &idata);
 
 	if (pools != NULL && pool_exists &&
 	    (argc == 1 || strcmp(argv[0], argv[1]) == 0)) {
@@ -3821,7 +3834,7 @@ zpool_do_import(int argc, char **argv)
 		 */
 		idata.scan = B_TRUE;
 		nvlist_free(pools);
-		pools = zpool_search_import(g_zfs, &idata, &libzfs_config_ops);
+		pools = zpool_search_import(&lpch, &idata);
 
 		err = import_pools(pools, props, mntopts, flags,
 		    argc >= 1 ? argv[0] : NULL,
@@ -5416,7 +5429,13 @@ print_zpool_dir_scripts(char *dirpath)
 	if ((dir = opendir(dirpath)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir(dir)) != NULL) {
-			sprintf(fullpath, "%s/%s", dirpath, ent->d_name);
+			if (snprintf(fullpath, sizeof (fullpath), "%s/%s",
+			    dirpath, ent->d_name) >= sizeof (fullpath)) {
+				(void) fprintf(stderr,
+				    gettext("internal error: "
+				    "ZPOOL_SCRIPTS_PATH too large.\n"));
+				exit(1);
+			}
 
 			/* Print the scripts */
 			if (stat(fullpath, &dir_stat) == 0)

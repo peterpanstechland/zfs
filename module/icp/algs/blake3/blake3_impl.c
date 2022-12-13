@@ -155,7 +155,6 @@ blake3_impl_setid(uint32_t id)
 		atomic_swap_32(&blake3_impl_chosen, IMPL_CYCLE);
 		break;
 	default:
-		ASSERT3U(id, >=, 0);
 		ASSERT3U(id, <, blake3_supp_impls_cnt);
 		atomic_swap_32(&blake3_impl_chosen, id);
 		break;
@@ -283,16 +282,16 @@ blake3_param_get(char *buffer, zfs_kernel_param_t *unused)
 
 	/* cycling */
 	fmt = IMPL_FMT(impl, IMPL_CYCLE);
-	cnt += sprintf(buffer + cnt, fmt, "cycle");
+	cnt += kmem_scnprintf(buffer + cnt, PAGE_SIZE - cnt, fmt, "cycle");
 
 	/* list fastest */
 	fmt = IMPL_FMT(impl, IMPL_FASTEST);
-	cnt += sprintf(buffer + cnt, fmt, "fastest");
+	cnt += kmem_scnprintf(buffer + cnt, PAGE_SIZE - cnt, fmt, "fastest");
 
 	/* list all supported implementations */
 	for (uint32_t i = 0; i < blake3_supp_impls_cnt; ++i) {
 		fmt = IMPL_FMT(impl, i);
-		cnt += sprintf(buffer + cnt, fmt,
+		cnt += kmem_scnprintf(buffer + cnt, PAGE_SIZE - cnt, fmt,
 		    blake3_supp_impls[i]->name);
 	}
 

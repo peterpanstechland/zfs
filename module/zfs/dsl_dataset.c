@@ -82,9 +82,9 @@
  * 3/1 memory split doesn't leave much room for 16M chunks.
  */
 #ifdef _ILP32
-int zfs_max_recordsize =  1 * 1024 * 1024;
+uint_t zfs_max_recordsize =  1 * 1024 * 1024;
 #else
-int zfs_max_recordsize = 16 * 1024 * 1024;
+uint_t zfs_max_recordsize = 16 * 1024 * 1024;
 #endif
 static int zfs_allow_redacted_dataset_mount = 0;
 
@@ -106,7 +106,7 @@ static void dsl_dataset_unset_remap_deadlist_object(dsl_dataset_t *ds,
 
 static void unload_zfeature(dsl_dataset_t *ds, spa_feature_t f);
 
-extern int spa_asize_inflation;
+extern uint_t spa_asize_inflation;
 
 static zil_header_t zero_zil;
 
@@ -640,6 +640,8 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, const void *tag,
 				    dsl_dataset_phys(ds)->ds_prev_snap_obj,
 				    ds, &ds->ds_prev);
 			}
+			if (err != 0)
+				goto after_dsl_bookmark_fini;
 			err = dsl_bookmark_init_ds(ds);
 		} else {
 			if (zfs_flags & ZFS_DEBUG_SNAPNAMES)
@@ -688,11 +690,11 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, const void *tag,
 			winner = dmu_buf_set_user_ie(dbuf, &ds->ds_dbu);
 
 		if (err != 0 || winner != NULL) {
-			bplist_destroy(&ds->ds_pending_deadlist);
 			dsl_deadlist_close(&ds->ds_deadlist);
 			if (dsl_deadlist_is_open(&ds->ds_remap_deadlist))
 				dsl_deadlist_close(&ds->ds_remap_deadlist);
 			dsl_bookmark_fini_ds(ds);
+after_dsl_bookmark_fini:
 			if (ds->ds_prev)
 				dsl_dataset_rele(ds->ds_prev, ds);
 			dsl_dir_rele(ds->ds_dir, ds);
@@ -703,6 +705,7 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, const void *tag,
 
 			list_destroy(&ds->ds_prop_cbs);
 			list_destroy(&ds->ds_sendstreams);
+			bplist_destroy(&ds->ds_pending_deadlist);
 			mutex_destroy(&ds->ds_lock);
 			mutex_destroy(&ds->ds_opening_lock);
 			mutex_destroy(&ds->ds_sendstream_lock);
@@ -1695,7 +1698,6 @@ dsl_dataset_snapshot_sync_impl(dsl_dataset_t *ds, const char *snapname,
 	dsl_dataset_phys_t *dsphys;
 	uint64_t dsobj, crtxg;
 	objset_t *mos = dp->dp_meta_objset;
-	static zil_header_t zero_zil __maybe_unused;
 	objset_t *os __maybe_unused;
 
 	ASSERT(RRW_WRITE_HELD(&dp->dp_config_rwlock));
@@ -1754,6 +1756,21 @@ dsl_dataset_snapshot_sync_impl(dsl_dataset_t *ds, const char *snapname,
 		if (zfeature_active(f, ds->ds_feature[f])) {
 			dsl_dataset_activate_feature(dsobj, f,
 			    ds->ds_feature[f], tx);
+		}
+	}
+
+	/*
+	 * We are not allowed to dirty a filesystem when done receiving
+	 * a snapshot. In this case the flag SPA_FEATURE_LARGE_BLOCKS will
+	 * not be set and a subsequent encrypted raw send will fail. Hence
+	 * activate this feature if needed here.
+	 */
+	for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
+		if (zfeature_active(f, ds->ds_feature_activation[f]) &&
+		    !(zfeature_active(f, ds->ds_feature[f]))) {
+			dsl_dataset_activate_feature(dsobj, f,
+			    ds->ds_feature_activation[f], tx);
+			ds->ds_feature[f] = ds->ds_feature_activation[f];
 		}
 	}
 
@@ -2125,8 +2142,6 @@ dsl_livelist_should_disable(dsl_dataset_t *ds)
 
 	used = dsl_dir_get_usedds(ds->ds_dir);
 	referenced = dsl_get_referenced(ds);
-	ASSERT3U(referenced, >=, 0);
-	ASSERT3U(used, >=, 0);
 	if (referenced == 0)
 		return (B_FALSE);
 	percent_shared = (100 * (referenced - used)) / referenced;
@@ -2739,6 +2754,8 @@ dsl_get_mountpoint(dsl_dataset_t *ds, const char *dsname, char *value,
 		    relpath[0] != '\0'))
 			mnt = value + 1;
 
+		mnt = kmem_strdup(mnt);
+
 		if (relpath[0] == '\0') {
 			(void) snprintf(value, ZAP_MAXVALUELEN, "%s%s",
 			    root, mnt);
@@ -2748,6 +2765,7 @@ dsl_get_mountpoint(dsl_dataset_t *ds, const char *dsname, char *value,
 			    relpath);
 		}
 		kmem_free(buf, ZAP_MAXVALUELEN);
+		kmem_strfree(mnt);
 	}
 
 	return (0);
@@ -3281,7 +3299,6 @@ dsl_dataset_promote_check(void *arg, dmu_tx_t *tx)
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	dsl_dataset_t *hds;
 	struct promotenode *snap;
-	dsl_dataset_t *origin_ds, *origin_head;
 	int err;
 	uint64_t unused;
 	uint64_t ss_mv_cnt;
@@ -3301,12 +3318,11 @@ dsl_dataset_promote_check(void *arg, dmu_tx_t *tx)
 	}
 
 	snap = list_head(&ddpa->shared_snaps);
-	origin_head = snap->ds;
 	if (snap == NULL) {
 		err = SET_ERROR(ENOENT);
 		goto out;
 	}
-	origin_ds = snap->ds;
+	dsl_dataset_t *const origin_ds = snap->ds;
 
 	/*
 	 * Encrypted clones share a DSL Crypto Key with their origin's dsl dir.
@@ -3402,10 +3418,10 @@ dsl_dataset_promote_check(void *arg, dmu_tx_t *tx)
 	 * Check that bookmarks that are being transferred don't have
 	 * name conflicts.
 	 */
-	for (dsl_bookmark_node_t *dbn = avl_first(&origin_head->ds_bookmarks);
+	for (dsl_bookmark_node_t *dbn = avl_first(&origin_ds->ds_bookmarks);
 	    dbn != NULL && dbn->dbn_phys.zbm_creation_txg <=
 	    dsl_dataset_phys(origin_ds)->ds_creation_txg;
-	    dbn = AVL_NEXT(&origin_head->ds_bookmarks, dbn)) {
+	    dbn = AVL_NEXT(&origin_ds->ds_bookmarks, dbn)) {
 		if (strlen(dbn->dbn_name) >= max_snap_len) {
 			err = SET_ERROR(ENAMETOOLONG);
 			goto out;
@@ -3419,7 +3435,8 @@ dsl_dataset_promote_check(void *arg, dmu_tx_t *tx)
 			conflicting_snaps = B_TRUE;
 		} else if (err == ESRCH) {
 			err = 0;
-		} else if (err != 0) {
+		}
+		if (err != 0) {
 			goto out;
 		}
 	}
@@ -4970,7 +4987,7 @@ dsl_dataset_oldest_snapshot(spa_t *spa, uint64_t head_ds, uint64_t min_txg,
 	return (0);
 }
 
-ZFS_MODULE_PARAM(zfs, zfs_, max_recordsize, INT, ZMOD_RW,
+ZFS_MODULE_PARAM(zfs, zfs_, max_recordsize, UINT, ZMOD_RW,
 	"Max allowed record size");
 
 ZFS_MODULE_PARAM(zfs, zfs_, allow_redacted_dataset_mount, INT, ZMOD_RW,

@@ -690,6 +690,7 @@ zfs_open(libzfs_handle_t *hdl, const char *path, int types)
 	 */
 	if (!zfs_validate_name(hdl, path, types, B_FALSE)) {
 		(void) zfs_error(hdl, EZFS_INVALIDNAME, errbuf);
+		errno = EINVAL;
 		return (NULL);
 	}
 
@@ -717,8 +718,8 @@ zfs_open(libzfs_handle_t *hdl, const char *path, int types)
 		 * to get the parent dataset name only.
 		 */
 		assert(bookp - path < sizeof (dsname));
-		(void) strncpy(dsname, path, bookp - path);
-		dsname[bookp - path] = '\0';
+		(void) strlcpy(dsname, path,
+		    MIN(sizeof (dsname), bookp - path + 1));
 
 		/*
 		 * Create handle for the parent dataset.
@@ -737,6 +738,7 @@ zfs_open(libzfs_handle_t *hdl, const char *path, int types)
 		    &cb_data) == 0) && (cb_data.zhp == NULL)) {
 			(void) zfs_error(hdl, EZFS_NOENT, errbuf);
 			zfs_close(pzhp);
+			errno = ENOENT;
 			return (NULL);
 		}
 		if (cb_data.zhp == NULL) {
@@ -755,6 +757,7 @@ zfs_open(libzfs_handle_t *hdl, const char *path, int types)
 	if (!(types & zhp->zfs_type)) {
 		(void) zfs_error(hdl, EZFS_BADTYPE, errbuf);
 		zfs_close(zhp);
+		errno = EINVAL;
 		return (NULL);
 	}
 
@@ -2006,7 +2009,8 @@ zfs_prop_inherit(zfs_handle_t *zhp, const char *propname, boolean_t received)
 	if ((ret = changelist_prefix(cl)) != 0)
 		goto error;
 
-	if ((ret = zfs_ioctl(zhp->zfs_hdl, ZFS_IOC_INHERIT_PROP, &zc)) != 0) {
+	if (zfs_ioctl(zhp->zfs_hdl, ZFS_IOC_INHERIT_PROP, &zc) != 0) {
+		changelist_free(cl);
 		return (zfs_standard_error(hdl, errno, errbuf));
 	} else {
 
@@ -2086,16 +2090,16 @@ zfs_is_recvd_props_mode(zfs_handle_t *zhp)
 }
 
 static void
-zfs_set_recvd_props_mode(zfs_handle_t *zhp, uint64_t *cookie)
+zfs_set_recvd_props_mode(zfs_handle_t *zhp, uintptr_t *cookie)
 {
-	*cookie = (uint64_t)(uintptr_t)zhp->zfs_props;
+	*cookie = (uintptr_t)zhp->zfs_props;
 	zhp->zfs_props = zhp->zfs_recvd_props;
 }
 
 static void
-zfs_unset_recvd_props_mode(zfs_handle_t *zhp, uint64_t *cookie)
+zfs_unset_recvd_props_mode(zfs_handle_t *zhp, uintptr_t *cookie)
 {
-	zhp->zfs_props = (nvlist_t *)(uintptr_t)*cookie;
+	zhp->zfs_props = (nvlist_t *)*cookie;
 	*cookie = 0;
 }
 
@@ -2372,7 +2376,7 @@ zfs_prop_get_recvd(zfs_handle_t *zhp, const char *propname, char *propbuf,
 	prop = zfs_name_to_prop(propname);
 
 	if (prop != ZPROP_USERPROP) {
-		uint64_t cookie;
+		uintptr_t cookie;
 		if (!nvlist_exists(zhp->zfs_recvd_props, propname))
 			return (-1);
 		zfs_set_recvd_props_mode(zhp, &cookie);
@@ -3453,8 +3457,8 @@ check_parents(libzfs_handle_t *hdl, const char *path, uint64_t *zoned,
 	/* check to see if the pool exists */
 	if ((slash = strchr(parent, '/')) == NULL)
 		slash = parent + strlen(parent);
-	(void) strncpy(zc.zc_name, parent, slash - parent);
-	zc.zc_name[slash - parent] = '\0';
+	(void) strlcpy(zc.zc_name, parent,
+	    MIN(sizeof (zc.zc_name), slash - parent + 1));
 	if (zfs_ioctl(hdl, ZFS_IOC_OBJSET_STATS, &zc) != 0 &&
 	    errno == ENOENT) {
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
@@ -4163,6 +4167,8 @@ zfs_snapshot_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, nvlist_t *props)
 	 * same pool, as does lzc_snapshot (below).
 	 */
 	elem = nvlist_next_nvpair(snaps, NULL);
+	if (elem == NULL)
+		return (-1);
 	(void) strlcpy(pool, nvpair_name(elem), sizeof (pool));
 	pool[strcspn(pool, "/@")] = '\0';
 	zpool_hdl = zpool_open(hdl, pool);
